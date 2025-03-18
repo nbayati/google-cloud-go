@@ -79,6 +79,7 @@ type tokenProvider struct {
 }
 
 func (tp *tokenProvider) Token(ctx context.Context) (*auth.Token, error) {
+	println("inside func (tp *tokenProvider) Token(ctx context.Context) (*auth.Token, error) {")
 	opts := tp.o
 
 	clientAuth := stsexchange.ClientAuthentication{
