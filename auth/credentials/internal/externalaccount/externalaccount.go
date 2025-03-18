@@ -29,6 +29,7 @@ import (
 	"cloud.google.com/go/auth/credentials/internal/impersonate"
 	"cloud.google.com/go/auth/credentials/internal/stsexchange"
 	"cloud.google.com/go/auth/internal/credsfile"
+	"cloud.google.com/go/auth/internal/trustboundary"
 	"github.com/googleapis/gax-go/v2/internallog"
 )
 
@@ -36,9 +37,11 @@ const (
 	timeoutMinimum = 5 * time.Second
 	timeoutMaximum = 120 * time.Second
 
-	universeDomainPlaceholder = "UNIVERSE_DOMAIN"
-	defaultTokenURL           = "https://sts.UNIVERSE_DOMAIN/v1/token"
-	defaultUniverseDomain     = "googleapis.com"
+	universeDomainPlaceholder         = "UNIVERSE_DOMAIN"
+	defaultTokenURL                   = "https://sts.UNIVERSE_DOMAIN/v1/token"
+	defaultUniverseDomain             = "googleapis.com"
+	workforceAllowedLocationsEndpoint = "iamcredentials.googleapis.com/v1/locations/global/workforcePools/%s/allowedLocations"
+	workloadAllowedLocationsEndpoint  = "iamcredentials.googleapis.com/v1/projects/%s/locations/global/workloadIdentityPools/%s/allowedLocations"
 )
 
 var (
@@ -48,6 +51,8 @@ var (
 	}
 	validWorkforceAudiencePattern *regexp.Regexp = regexp.MustCompile(`//iam\.googleapis\.com/locations/[^/]+/workforcePools/`)
 )
+
+type TrustBoundaryData = trustboundary.TrustBoundaryData
 
 // Options stores the configuration for fetching tokens with external credentials.
 type Options struct {
@@ -111,6 +116,9 @@ type Options struct {
 	// enabled by setting GOOGLE_SDK_GO_LOGGING_LEVEL in which case a default
 	// logger will be used. Optional.
 	Logger *slog.Logger
+	// // TrustBoundaryData represents the trust boundary.
+	// TrustBoundaryData TrustBoundaryData
+	TrustBoundaryData TrustBoundaryData
 }
 
 // SubjectTokenProvider can be used to supply a subject token to exchange for a
@@ -227,6 +235,7 @@ func (o *Options) resolveTokenURL() {
 // NewTokenProvider returns a [cloud.google.com/go/auth.TokenProvider]
 // configured with the provided options.
 func NewTokenProvider(opts *Options) (auth.TokenProvider, error) {
+	println("in NewTokenProvider - external account")
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
@@ -269,6 +278,93 @@ func NewTokenProvider(opts *Options) (auth.TokenProvider, error) {
 		return nil, err
 	}
 	return auth.NewCachedTokenProvider(imp, nil), nil
+}
+
+func (tp *tokenProvider) getAllowedLocationsEndpoint() (string, error) {
+	//Workforce pool
+	if tp.opts.WorkforcePoolUserProject != "" {
+		pattern := regexp.MustCompile(`workforcePools/([^/]+)`)
+		matches := pattern.FindStringSubmatch(tp.opts.Audience)
+		if len(matches) != 2 {
+			return "", fmt.Errorf("externalaccount: could not extract pool ID from audience %s", tp.opts.Audience)
+		}
+		poolID := matches[1]
+		return fmt.Sprintf(workforceAllowedLocationsEndpoint, poolID), nil
+	}
+
+	//Workload pool
+	workloadAudiencePattern := regexp.MustCompile(`//iam\.googleapis\.com/projects/([^/]+)/locations/global/workloadIdentityPools/([^/]+)`)
+	if workloadAudiencePattern.MatchString(tp.opts.Audience) {
+		matches := workloadAudiencePattern.FindStringSubmatch(tp.opts.Audience)
+		if len(matches) != 3 {
+			return "", fmt.Errorf("externalaccount: invalid workload identity pool audience format: %s", tp.opts.Audience)
+		}
+		projectID := matches[1]
+		poolID := matches[2]
+		fmt.Println("Project ID:", projectID)
+		fmt.Println("Pool ID:", poolID)
+		return fmt.Sprintf(workloadAllowedLocationsEndpoint, projectID, poolID), nil
+
+	}
+
+	//No need for lookup if not workforce/workload
+	return "", nil
+}
+
+func (tp *tokenProvider) LookupTrustBoundary(ctx context.Context) (*TrustBoundaryData, error) {
+	return nil, nil
+	// // 1. Check cache
+	// if tp.opts.TrustBoundaryData.EncodedLocations() != "" {
+	// 	return &tp.opts.TrustBoundaryData, nil
+	// }
+
+	// // 2. Fetch from endpoint
+	// url, err := tp.getAllowedLocationsEndpoint()
+	// if url == "" {
+	// 	// the credential is not support with
+	// 	// negarb: I think we should save 0x0 so we don't keep calling the endpoint for an unsupported type
+	// 	return nil, nil
+	// }
+
+	// fmt.Println("the url is: ", url)
+
+	// if err != nil {
+	// 	return nil, fmt.Errorf("externalaccount: failed to get trust bounday lookup endpoint: %w", err)
+	// }
+
+	// req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("externalaccount: failed to create trust boundary request: %w", err)
+	// }
+
+	// response, err := tp.client.Do(req)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("externalaccount: failed to fetch trust boundary: %w", err)
+	// }
+	// defer response.Body.Close()
+
+	// body, err := io.ReadAll(response.Body)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("externalaccount: failed to read trust boundary response: %w", err)
+	// }
+
+	// if response.StatusCode != http.StatusOK {
+	// 	return nil, fmt.Errorf("externalaccount: trust boundary request failed with status: %s, body: %s", response.Status, string(body))
+	// }
+
+	// trustBoundaryData := TrustBoundaryData{}
+
+	// if err := json.Unmarshal(body, &trustBoundaryData); err != nil {
+	// 	return nil, fmt.Errorf("externalaccount: failed to fetch trust boundary data: %w", err)
+	// }
+
+	// var responseData map[string]interface{}
+	// if err := json.Unmarshal(body, &responseData); err != nil {
+	// 	return nil, fmt.Errorf("externalaccount: failed to unmarshal trust boundary json: %v", err)
+	// }
+
+	// tp.opts.TrustBoundaryData = trustBoundaryData
+	// return &tp.opts.TrustBoundaryData, nil
 }
 
 type subjectTokenProvider interface {
@@ -330,12 +426,24 @@ func (tp *tokenProvider) Token(ctx context.Context) (*auth.Token, error) {
 	tok := &auth.Token{
 		Value: stsResp.AccessToken,
 		Type:  stsResp.TokenType,
+		// TrustBoundaryEncodedLocations: trustBoundaryEncodedLocations,
 	}
 	// The RFC8693 doesn't define the explicit 0 of "expires_in" field behavior.
 	if stsResp.ExpiresIn <= 0 {
 		return nil, fmt.Errorf("credentials: got invalid expiry from security token service")
 	}
 	tok.Expiry = Now().Add(time.Duration(stsResp.ExpiresIn) * time.Second)
+
+	fmt.Println("the project is: ", tp.opts.WorkforcePoolUserProject)
+	if err != nil {
+		return nil, err
+	}
+
+	trustBoundaryEncodedLocations, err := tp.LookupTrustBoundary(ctx)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println(trustBoundaryEncodedLocations)
 	return tok, nil
 }
 
@@ -415,6 +523,7 @@ func newSubjectTokenProvider(o *Options) (subjectTokenProvider, error) {
 		}
 		return &x509Provider{}, nil
 	}
+
 	return nil, errors.New("credentials: unable to parse credential source")
 }
 
