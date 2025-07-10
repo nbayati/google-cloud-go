@@ -60,8 +60,8 @@ func TestNewNoOpTrustBoundaryData(t *testing.T) {
 	}
 
 	publicData := internalToPublicAuthData(data)
-	if !publicData.IsNoOpOrEmpty() {
-		t.Errorf("internalToPublicAuthData(NewNoOpTrustBoundaryData()).IsNoOpOrEmpty() = false, want true")
+	if !(publicData.IsNoOp() || publicData.IsEmpty()) {
+		t.Errorf("internalToPublicAuthData(NewNoOpTrustBoundaryData()).IsNoOp() || IsEmpty() = false, want true")
 	}
 }
 
@@ -130,8 +130,8 @@ func TestNewTrustBoundaryData(t *testing.T) {
 			}
 
 			publicData := internalToPublicAuthData(data)
-			if got := publicData.IsNoOpOrEmpty(); got != tt.wantIsNoOpOrEmpty {
-				t.Errorf("internalToPublicAuthData(NewTrustBoundaryData(...)).IsNoOpOrEmpty() = %v, want %v", got, tt.wantIsNoOpOrEmpty)
+			if got := publicData.IsNoOp() || publicData.IsEmpty(); got != tt.wantIsNoOpOrEmpty {
+				t.Errorf("internalToPublicAuthData(NewTrustBoundaryData(...)).IsNoOp() || IsEmpty() = %v, want %v", got, tt.wantIsNoOpOrEmpty)
 			}
 		})
 	}
@@ -141,8 +141,8 @@ func TestData_Methods_NilReceiver(t *testing.T) {
 	var data *Data = nil
 
 	publicData := internalToPublicAuthData(data)
-	if !publicData.IsNoOpOrEmpty() {
-		t.Errorf("internalToPublicAuthData(nil).IsNoOpOrEmpty() = false, want true")
+	if !(publicData.IsNoOp() || publicData.IsEmpty()) {
+		t.Errorf("internalToPublicAuthData(nil).IsNoOp() || IsEmpty() = false, want true")
 	}
 }
 
@@ -155,7 +155,7 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 	tests := []struct {
 		name           string
 		serverResponse *serverResponse
-		accessToken    string
+		token          *auth.Token
 		urlOverride    *string // To test empty URL
 		useNilClient   bool
 		ctx            context.Context
@@ -169,9 +169,9 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 				status: http.StatusOK,
 				body:   `{"locations": ["us-central1"], "encodedLocations": "0xABC"}`,
 			},
-			accessToken: "test-token",
-			ctx:         context.Background(),
-			wantData:    NewTrustBoundaryData([]string{"us-central1"}, "0xABC"),
+			token:    &auth.Token{Value: "test-token"},
+			ctx:      context.Background(),
+			wantData: NewTrustBoundaryData([]string{"us-central1"}, "0xABC"),
 			wantReqHeaders: map[string]string{
 				"Authorization": "Bearer test-token",
 			},
@@ -182,9 +182,9 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 				status: http.StatusOK,
 				body:   `{"encodedLocations": "0x0"}`,
 			},
-			accessToken: "test-token",
-			ctx:         context.Background(),
-			wantData:    NewTrustBoundaryData(nil, "0x0"),
+			token:    &auth.Token{Value: "test-token"},
+			ctx:      context.Background(),
+			wantData: NewTrustBoundaryData(nil, "0x0"),
 		},
 		{
 			name: "Success - OK No-Op response with empty locations array",
@@ -192,9 +192,9 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 				status: http.StatusOK,
 				body:   `{"locations": [], "encodedLocations": "0x0"}`,
 			},
-			accessToken: "test-token",
-			ctx:         context.Background(),
-			wantData:    NewTrustBoundaryData([]string{}, "0x0"),
+			token:    &auth.Token{Value: "test-token"},
+			ctx:      context.Background(),
+			wantData: NewTrustBoundaryData([]string{}, "0x0"),
 		},
 		{
 			name: "Error - Non-200 Status",
@@ -202,9 +202,9 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 				status: http.StatusInternalServerError,
 				body:   "server error",
 			},
-			accessToken: "test-token",
-			ctx:         context.Background(),
-			wantErr:     "trust boundary request failed with status: 500 Internal Server Error, body: server error",
+			token:   &auth.Token{Value: "test-token"},
+			ctx:     context.Background(),
+			wantErr: "trust boundary request failed with status: 500 Internal Server Error, body: server error",
 		},
 		{
 			name: "Error - Malformed JSON",
@@ -212,9 +212,9 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 				status: http.StatusOK,
 				body:   `{"encodedLocations": "0x123", malformed`,
 			},
-			accessToken: "test-token",
-			ctx:         context.Background(),
-			wantErr:     "failed to unmarshal trust boundary response",
+			token:   &auth.Token{Value: "test-token"},
+			ctx:     context.Background(),
+			wantErr: "failed to unmarshal trust boundary response",
 		},
 		{
 			name: "Error - Missing encodedLocations",
@@ -222,9 +222,9 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 				status: http.StatusOK,
 				body:   `{"locations": ["us-east1"]}`,
 			},
-			accessToken: "test-token",
-			ctx:         context.Background(),
-			wantErr:     "invalid API response: encodedLocations is empty",
+			token:   &auth.Token{Value: "test-token"},
+			ctx:     context.Background(),
+			wantErr: "invalid API response: encodedLocations is empty",
 		},
 		{
 			name: "Error - Empty encodedLocations string",
@@ -232,33 +232,33 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 				status: http.StatusOK,
 				body:   `{"locations": [], "encodedLocations": ""}`,
 			},
-			accessToken: "test-token",
-			ctx:         context.Background(),
-			wantErr:     "invalid API response: encodedLocations is empty",
+			token:   &auth.Token{Value: "test-token"},
+			ctx:     context.Background(),
+			wantErr: "invalid API response: encodedLocations is empty",
 		},
 		{
 			name:         "Error - Nil HTTP client",
 			useNilClient: true,
-			accessToken:  "test-token",
+			token:        &auth.Token{Value: "test-token"},
 			ctx:          context.Background(),
 			wantErr:      "HTTP client is required",
 		},
 		{
 			name:        "Error - Empty URL",
 			urlOverride: new(string),
-			accessToken: "test-token",
+			token:       &auth.Token{Value: "test-token"},
 			ctx:         context.Background(),
 			wantErr:     "URL cannot be empty",
 		},
 		{
 			name: "Error - Empty Access Token",
 			serverResponse: &serverResponse{
-				status: http.StatusOK,
-				body:   `{"encodedLocations": "0x0"}`,
+				status: http.StatusOK,                 // This won't be hit, but for completeness
+				body:   `{"encodedLocations": "0x0"}`, // This won't be hit
 			},
-			accessToken: "",
-			ctx:         context.Background(),
-			wantErr:     "access token required for lookup API authentication",
+			token:   &auth.Token{Value: ""},
+			ctx:     context.Background(),
+			wantErr: "access token required for lookup API authentication",
 		},
 	}
 
@@ -295,7 +295,7 @@ func TestFetchTrustBoundaryData(t *testing.T) {
 				client = http.DefaultClient
 			}
 
-			data, err := fetchTrustBoundaryData(tt.ctx, client, url, tt.accessToken, nil)
+			data, err := fetchTrustBoundaryData(tt.ctx, client, url, tt.token, nil)
 
 			if tt.wantErr != "" {
 				if err == nil {
@@ -651,7 +651,7 @@ func TestNewTrustBoundaryDataProvider(t *testing.T) {
 
 func TestTrustBoundaryDataProvider_GetTrustBoundaryData(t *testing.T) {
 	ctx := context.Background()
-	defaultAccessToken := "test-access-token"
+	defaultToken := &auth.Token{Value: "test-access-token"}
 
 	type serverResponse struct {
 		status int
@@ -787,7 +787,7 @@ func TestTrustBoundaryDataProvider_GetTrustBoundaryData(t *testing.T) {
 				internalProvider.data = tt.initialCachedData
 			}
 
-			gotData, err := provider.GetTrustBoundaryData(ctx, defaultAccessToken)
+			gotData, err := provider.GetTrustBoundaryData(ctx, defaultToken)
 
 			if tt.wantErr != "" {
 				if err == nil {
