@@ -1154,8 +1154,6 @@ func (c *grpcStorageClient) NewMultiRangeDownloader(ctx context.Context, params 
 	// object metadata.
 	msg := resp.response
 	obj := msg.GetMetadata()
-	// This is the size of the entire object, even if only a range was requested.
-	size := obj.GetSize()
 
 	mrd := &gRPCBidiReader{
 		stream:           resp.stream,
@@ -1271,6 +1269,7 @@ func (c *grpcStorageClient) NewMultiRangeDownloader(ctx context.Context, params 
 				if err == nil {
 					mrd.mu.Lock()
 					if len(mrd.activeRanges) == 0 && mrd.numActiveRanges == 0 {
+						mrd.mu.Unlock()
 						mrd.closeReceiver <- true
 						mrd.closeSender <- true
 						return
@@ -1279,34 +1278,37 @@ func (c *grpcStorageClient) NewMultiRangeDownloader(ctx context.Context, params 
 					arr := resp.GetObjectDataRanges()
 					for _, val := range arr {
 						id := val.GetReadRange().GetReadId()
-						mrd.mu.Lock()
-						_, ok := mrd.activeRanges[id]
-						if !ok {
-							// it's ok to ignore responses for read_id not in map as user would have been notified by callback.
-							continue
-						}
-						_, err = mrd.activeRanges[id].writer.Write(val.GetChecksummedData().GetContent())
-						if err != nil {
-							mrd.activeRanges[id].callback(mrd.activeRanges[id].offset, mrd.activeRanges[id].totalBytesWritten, err)
-							mrd.numActiveRanges--
-							delete(mrd.activeRanges, id)
-						} else {
-							mrd.activeRanges[id] = mrdRange{
-								readID:              mrd.activeRanges[id].readID,
-								writer:              mrd.activeRanges[id].writer,
-								offset:              mrd.activeRanges[id].offset,
-								limit:               mrd.activeRanges[id].limit,
-								currentBytesWritten: mrd.activeRanges[id].currentBytesWritten + int64(len(val.GetChecksummedData().GetContent())),
-								totalBytesWritten:   mrd.activeRanges[id].totalBytesWritten + int64(len(val.GetChecksummedData().GetContent())),
-								callback:            mrd.activeRanges[id].callback,
+						func() {
+							mrd.mu.Lock()
+							defer mrd.mu.Unlock()
+							currRange, ok := mrd.activeRanges[id]
+							if !ok {
+								// it's ok to ignore responses for read_id not in map as user would have been notified by callback.
+								return
 							}
-						}
-						if val.GetRangeEnd() {
-							mrd.activeRanges[id].callback(mrd.activeRanges[id].offset, mrd.activeRanges[id].totalBytesWritten, nil)
-							mrd.numActiveRanges--
-							delete(mrd.activeRanges, id)
-						}
-						mrd.mu.Unlock()
+							_, err = currRange.writer.Write(val.GetChecksummedData().GetContent())
+							if err != nil {
+								currRange.callback(currRange.offset, currRange.totalBytesWritten, err)
+								mrd.numActiveRanges--
+								delete(mrd.activeRanges, id)
+							} else {
+								currRange = mrdRange{
+									readID:              currRange.readID,
+									writer:              currRange.writer,
+									offset:              currRange.offset,
+									limit:               currRange.limit,
+									currentBytesWritten: currRange.currentBytesWritten + int64(len(val.GetChecksummedData().GetContent())),
+									totalBytesWritten:   currRange.totalBytesWritten + int64(len(val.GetChecksummedData().GetContent())),
+									callback:            currRange.callback,
+								}
+								mrd.activeRanges[id] = currRange
+							}
+							if val.GetRangeEnd() {
+								currRange.callback(currRange.offset, currRange.totalBytesWritten, nil)
+								mrd.numActiveRanges--
+								delete(mrd.activeRanges, id)
+							}
+						}()
 					}
 				}
 			}
@@ -1353,16 +1355,12 @@ func (c *grpcStorageClient) NewMultiRangeDownloader(ctx context.Context, params 
 		mrd.mu.Unlock()
 	}
 
-	mrd.mu.Lock()
-	mrd.objectSize = size
-	mrd.mu.Unlock()
-
 	go sender()
 	go receiver()
 
 	return &MultiRangeDownloader{
 		Attrs: ReaderObjectAttrs{
-			Size:            size,
+			Size:            obj.GetSize(), // this is the size of the entire object, even if only a range was requested.
 			ContentType:     obj.GetContentType(),
 			ContentEncoding: obj.GetContentEncoding(),
 			CacheControl:    obj.GetCacheControl(),
@@ -1383,7 +1381,6 @@ type gRPCBidiReader struct {
 	readIDGenerator *readIDGenerator
 	reopen          func(ReadHandle) (*bidiReadStreamResponse, context.CancelFunc, error)
 	readSpec        *storagepb.BidiReadObjectSpec
-	objectSize      int64 // always use the mutex when accessing this variable
 	closeReceiver   chan bool
 	closeSender     chan bool
 	senderRetry     chan bool
@@ -1466,8 +1463,8 @@ func (mrd *gRPCBidiReader) add(output io.Writer, offset, limit int64, callback f
 		spec := mrdRange{readID: id, writer: output, offset: offset, limit: limit, currentBytesWritten: 0, totalBytesWritten: 0, callback: callback}
 		mrd.mu.Lock()
 		mrd.numActiveRanges++
-		mrd.rangesToRead <- []mrdRange{spec}
 		mrd.mu.Unlock()
+		mrd.rangesToRead <- []mrdRange{spec}
 	} else {
 		callback(offset, 0, errors.New("storage: cannot add range because the stream is closed"))
 	}
@@ -1654,8 +1651,19 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 	msg := res.decoder.msg
 	obj := msg.GetMetadata()
 	handle := ReadHandle(msg.GetReadHandle().GetHandle())
+
 	// This is the size of the entire object, even if only a range was requested.
+	// Object size can be out of date in the case of unfinalized objects.
 	size := obj.GetSize()
+
+	finalized := obj.GetFinalizeTime() != nil
+	negativeOffset := params.offset < 0
+	if !finalized && negativeOffset {
+		// Fix the offset and length of a negative-offset read at time of first
+		// response to ensure data integrity.
+		params.offset = obj.Size + params.offset
+		params.length = obj.Size - params.offset
+	}
 
 	// Only support checksums when reading an entire object, not a range.
 	var (
@@ -1672,6 +1680,11 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 	startOffset := params.offset
 	if params.offset < 0 {
 		startOffset = size + params.offset
+	}
+	// If caller has specified a negative start offset that's larger than the
+	// reported size, start at the beginning of the object.
+	if startOffset < 0 {
+		startOffset = 0
 	}
 
 	// The remaining bytes are the lesser of the requested range and all bytes
@@ -1704,15 +1717,18 @@ func (c *grpcStorageClient) NewRangeReader(ctx context.Context, params *newRange
 			cancel: cancel,
 			size:   size,
 			// Preserve the decoder to read out object data when Read/WriteTo is called.
-			currMsg:   res.decoder,
-			settings:  s,
-			zeroRange: params.length == 0,
-			wantCRC:   wantCRC,
-			checkCRC:  checkCRC,
+			currMsg:        res.decoder,
+			settings:       s,
+			zeroRange:      params.length == 0,
+			wantCRC:        wantCRC,
+			checkCRC:       checkCRC,
+			finalized:      finalized,
+			negativeOffset: negativeOffset,
 		},
-		checkCRC: checkCRC,
-		handle:   &handle,
-		remain:   remain,
+		checkCRC:    checkCRC,
+		handle:      &handle,
+		remain:      remain,
+		unfinalized: !finalized,
 	}
 
 	// For a zero-length request, explicitly close the stream and set remaining
@@ -1850,17 +1866,19 @@ type bidiReadStreamResponse struct {
 
 // gRPCReader is used by storage.Reader if the experimental option WithGRPCBidiReads is passed.
 type gRPCReader struct {
-	seen, size int64
-	zeroRange  bool
-	stream     storagepb.Storage_BidiReadObjectClient
-	reopen     func(seen int64) (*readStreamResponse, context.CancelFunc, error)
-	leftovers  []byte
-	currMsg    *readResponseDecoder // decoder for the current message
-	cancel     context.CancelFunc
-	settings   *settings
-	checkCRC   bool   // should we check the CRC?
-	wantCRC    uint32 // the CRC32c value the server sent in the header
-	gotCRC     uint32 // running crc
+	seen, size     int64
+	zeroRange      bool
+	finalized      bool // if we are reading from a finalized object; in this case, remain and size may be inaccurate
+	negativeOffset bool
+	stream         storagepb.Storage_BidiReadObjectClient
+	reopen         func(seen int64) (*readStreamResponse, context.CancelFunc, error)
+	leftovers      []byte
+	currMsg        *readResponseDecoder // decoder for the current message
+	cancel         context.CancelFunc
+	settings       *settings
+	checkCRC       bool   // should we check the CRC?
+	wantCRC        uint32 // the CRC32c value the server sent in the header
+	gotCRC         uint32 // running crc
 }
 
 // Update the running CRC with the data in the slice, if CRC checking was enabled.
@@ -1882,7 +1900,7 @@ func (r *gRPCReader) runCRCCheck() error {
 func (r *gRPCReader) Read(p []byte) (int, error) {
 	// The entire object has been read by this reader, check the checksum if
 	// necessary and return EOF.
-	if r.size == r.seen || r.zeroRange {
+	if (r.finalized || r.negativeOffset) && r.size == r.seen || r.zeroRange {
 		if err := r.runCRCCheck(); err != nil {
 			return 0, err
 		}
@@ -1937,7 +1955,7 @@ func (r *gRPCReader) Read(p []byte) (int, error) {
 func (r *gRPCReader) WriteTo(w io.Writer) (int64, error) {
 	// The entire object has been read by this reader, check the checksum if
 	// necessary and return nil.
-	if r.size == r.seen || r.zeroRange {
+	if (r.finalized || r.negativeOffset) && r.size == r.seen || r.zeroRange {
 		if err := r.runCRCCheck(); err != nil {
 			return 0, err
 		}
